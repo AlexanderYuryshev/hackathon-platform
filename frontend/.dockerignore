@@ -1,0 +1,13 @@
+# Keep the build context tiny and builds reproducible.
+# node_modules (224 MB) and dist must NEVER enter the image context:
+# the Dockerfile runs `npm ci` itself and `COPY . .` would otherwise
+# overwrite the container's node_modules with the host's ones.
+node_modules
+dist
+.git
+.tanstack
+.output
+.nitro
+.vscode
+.devcontainer
+*.log

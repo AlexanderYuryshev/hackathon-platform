@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "gravity-ui": {
+      "source": "gravity-ui/skills",
+      "sourceType": "github",
+      "skillPath": "skills/gravity-ui/SKILL.md",
+      "computedHash": "c12ef6ce04e2fc456155de08b93b3a8bca8f8f074e3794c22add5b17b74f1df4"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# Go
+backend/bin/
+*.exe
+*.test
+*.out
+
+# Node
+node_modules/
+frontend/.nitro/
+frontend/.output/
+frontend/.tanstack/
+frontend/build/
+frontend/dist/
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.local
+*.pem
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Logs / tmp
+*.log
+tmp/

@@ -1,0 +1,39 @@
+name: Push benchmark metric
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run benchmark
+        run: |
+          # replace with your real benchmark command that prints a number (e.g. p95 latency in ms)
+          echo 124.3 > latency.txt
+          cat latency.txt
+
+      - name: Send metric to hackathon platform
+        env:
+          INGEST_URL: ${{ vars.HACKATHON_INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.HACKATHON_INGEST_TOKEN }}
+          HACKATHON_ID: ${{ vars.HACKATHON_ID }}
+          TEAM_ID: ${{ vars.TEAM_ID }}
+        run: |
+          VALUE=$(cat latency.txt)
+          curl -sf -X POST "$INGEST_URL/api/v1/ingest/metrics" \
+            -H "Authorization: Bearer $INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"hackathon_id\": \"$HACKATHON_ID\",
+              \"team_id\": \"$TEAM_ID\",
+              \"metric_key\": \"api_latency\",
+              \"value\": $VALUE,
+              \"external_event_id\": \"gha-${{ github.run_id }}-${{ github.run_attempt }}\",
+              \"captured_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+              \"metadata\": {\"repo\": \"${{ github.repository }}\", \"sha\": \"${{ github.sha }}\"}
+            }"

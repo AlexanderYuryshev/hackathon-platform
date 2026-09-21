@@ -1,0 +1,6 @@
+# Keep the build context tiny: only Go sources affect the image.
+bin/
+*.test
+*.out
+.git
+.gitignore

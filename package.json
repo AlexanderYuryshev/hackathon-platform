@@ -1,0 +1,16 @@
+{
+  "name": "hackaton-platform",
+  "version": "1.0.0",
+  "description": "MVP платформа для хакатонов: собирает автоматические и ручные метрики по командам, считает единый объяснимый score и показывает его в интерактивном Live Leaderboard.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

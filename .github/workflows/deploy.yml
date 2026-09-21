@@ -1,0 +1,346 @@
+# Deploy to a tiny VPS (5 GB disk / 1 GB RAM) over SSH.
+#
+# Strategy (fits the constraints):
+# - Build images on the GitHub runner (7 GB RAM), NEVER on the server:
+#   `vite build` and `go build` need >1 GB RAM and would OOM the VPS.
+# - Before anything else, STOP the stack (`compose down`) and wipe ALL
+#   images: while containers run, `image prune` cannot touch their images
+#   and reports "Total reclaimed space: 0B" forever — the ~1.7 GB of
+#   backend/frontend/postgres/nginx images are all pinned. After `down`
+#   the same prune frees ~2 GB. Downtime is a few minutes (the old flow
+#   already had it via --force-recreate). Volumes are NEVER touched
+#   (plain `down`, never `down -v`), so the Postgres data survives and the
+#   Deploy step picks up where it left off (migrate + idempotent seed + up).
+# - Ship images with `docker save | gzip | ssh ... 'gzip -dc | docker load'`:
+#   no container registry, no credentials, and the tarball NEVER lands on
+#   the 4 GB disk — it streams straight into `docker load`.
+# - If a later step fails, the stack simply stays down and the next deploy
+#   retries from a clean, roomy disk: cleanup needs no running stack,
+#   upload streams, deploy pulls base images and ups everything.
+# - `docker-compose.prod.yml` overlay caps memory everywhere and tunes
+#   Postgres to ~150 MB, so the stack fits in ~700 MB RAM.
+#
+# Required secrets (repo or environment secrets):
+#   SSH_HOST, SSH_USER, SSH_PRIVATE_KEY (preferred) and/or SSH_PASSWORD.
+# SSH port is 29742 (job env SSH_PORT).
+
+name: Deploy to VPS
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never overlap two deploys; never cancel a running one mid-way.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_PORT: 29742
+      APP_DIR: hackathon
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sanity check secrets
+        run: |
+          set -u
+          [ -n "$SSH_HOST" ] || { echo "::error::SSH_HOST secret is empty"; exit 1; }
+          [ -n "$SSH_USER" ] || { echo "::error::SSH_USER secret is empty"; exit 1; }
+          if [ -z "$SSH_PRIVATE_KEY" ] && [ -z "$SSH_PASSWORD" ]; then
+            echo "::error::Set SSH_PRIVATE_KEY (preferred) or SSH_PASSWORD secret"
+            exit 1
+          fi
+
+      # Backend (~15 MB, static Go binaries) and frontend (SSR bundle + prod
+      # node_modules only, devDeps stay in the build stage) are built here,
+      # where RAM is plentiful. Tags must match `image:` in docker-compose.yml
+      # so the server runs them with plain `up -d` (no --build, no rebuild).
+      - name: Build images (on runner, not on the 1 GB VPS)
+        run: |
+          set -eu
+          docker build -t hackathon-backend:deploy ./backend
+          docker build --build-arg VITE_API_URL=http://api:8080 -t hackathon-frontend:deploy ./frontend
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep hackathon
+
+      # One tarball with both images; gzip -1 = fastest, still small enough.
+      # Only final stages are saved (Go build stage and npm devDeps are not).
+      - name: Pack images
+        run: |
+          set -eu
+          docker save hackathon-backend:deploy hackathon-frontend:deploy | gzip -1 > /tmp/images.tar.gz
+          ls -lh /tmp/images.tar.gz
+
+      # Installs ~/.ssh/vps-sh: `vps-sh user@host 'cmd...'` using the private
+      # key when present, otherwise sshpass + password. Used by all steps below.
+      - name: Set up SSH client
+        run: |
+          set -eu
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          {
+            echo '#!/bin/bash'
+            echo 'exec ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 "$@"'
+          } > ~/.ssh/vps-ssh-base
+          chmod +x ~/.ssh/vps-ssh-base
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            # tr -d '\r': keys pasted from Windows editors carry CRLF,
+            # which ssh rejects with "invalid format".
+            printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/vps_key
+            chmod 600 ~/.ssh/vps_key
+            printf '#!/bin/bash\nexec "$HOME/.ssh/vps-ssh-base" -i "$HOME/.ssh/vps_key" "$@"\n' > ~/.ssh/vps-sh
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+            printf '#!/bin/bash\nexec sshpass -p "$SSH_PASSWORD" "$HOME/.ssh/vps-ssh-base" "$@"\n' > ~/.ssh/vps-sh
+          fi
+          chmod +x ~/.ssh/vps-sh
+          echo "$HOME/.ssh" >> "$GITHUB_PATH"
+          # NOTE: $GITHUB_PATH applies to subsequent steps only, so here
+          # vps-sh must be called by full path.
+          ~/.ssh/vps-sh "$SSH_USER@$SSH_HOST" 'echo "SSH OK: $(whoami)@$(hostname)"'
+
+      # Tiny disk (4 GB): THE step that makes deploys fit. Pruning while the
+      # stack runs is useless — every image is pinned by its container, hence
+      # the eternal "Total reclaimed space: 0B". So first STOP the stack,
+      # then wipe everything docker holds (images/networks/build cache).
+      # That frees ~2 GB (was: 374 MB free). Volumes are NEVER touched:
+      # plain `down`, never `down -v` — pgdata with the production DB stays,
+      # and the Deploy step below reups everything (migrate + idempotent
+      # seed + up + healthchecks). Site is down for a few minutes; a failed
+      # deploy retries cleanly from the roomy disk, nothing to untangle.
+      - name: Free disk space on server (stop stack + wipe images)
+        run: |
+          set -euo pipefail
+          vps-sh "$SSH_USER@$SSH_HOST" "APP_DIR=$APP_DIR bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+          if docker ps >/dev/null 2>&1; then D=docker; else D="sudo docker"; fi
+          APP_DIR="${APP_DIR:-hackathon}"
+          echo "--- images before cleanup ---"
+          $D images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | sort || true
+          rm -f /tmp/images.tar.gz || sudo rm -f /tmp/images.tar.gz || true
+          # Stop the stack so its images become prunable. Missing compose
+          # files (very first deploy) or an already-stopped stack: fine,
+          # continue wiping whatever is left.
+          if [ -f "$HOME/$APP_DIR/docker-compose.yml" ]; then
+            (cd "$HOME/$APP_DIR" && $D compose -f docker-compose.yml -f docker-compose.prod.yml down --remove-orphans) || true
+          else
+            echo "no compose files yet, skipping down"
+          fi
+          # Now nothing pins the images: remove containers, ALL images,
+          # networks and build cache. `volume prune` is deliberately absent
+          # (pgdata = production DB) and `down -v` is never used above.
+          $D container prune -f || true
+          $D image prune -af || true
+          $D builder prune -af || true
+          $D network prune -f || true
+          # Truncate already-grown container logs (rotation in compose only
+          # caps future growth). -n: fail fast instead of asking for a password.
+          sudo -n sh -c 'truncate -s 0 /var/lib/docker/containers/*/*-json.log' 2>/dev/null || true
+          # Host-level caches on top: .deb archives and the journal cap.
+          # Best-effort (|| true) — the free-space gate below is the only
+          # fatal check in this step.
+          sudo apt-get clean 2>/dev/null || true
+          sudo journalctl --vacuum-size=100M --vacuum-time=7d >/dev/null 2>&1 || true
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get autoremove --purge -y 2>/dev/null || true
+          echo "--- biggest dirs under /var (where to look if still full) ---"
+          sudo du -x -d1 /var 2>/dev/null | sort -rh | head -8 || true
+          echo "--- disk after cleanup ---"
+          df -h / || true
+          $D system df || true
+          echo "--- images after cleanup (expect: none) ---"
+          $D images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | sort || true
+          # Gate: after wiping ~1.7 GB of images there should be ~2 GB free.
+          # Streaming `docker load` needs 0 B on disk for the tarball itself;
+          # what follows is ~0.8 GB of our images + ~0.5 GB of re-pulled
+          # postgres/nginx. 400 MB is a tripwire for "the wipe did not
+          # happen" (e.g. docker daemon unreachable), not a tight budget.
+          avail_kb=$(df -k / --output=avail | tail -1)
+          if [ "${avail_kb:-0}" -lt 400000 ]; then
+            echo "ERROR: only ${avail_kb:-0} KB free on / after stop+wipe, expected ~2 GB"
+            echo "HINT: see 'biggest dirs' and 'docker system df' above; volumes were intentionally kept (DB data)."
+            exit 1
+          fi
+          REMOTE_EOF
+
+      # Docker + 2 GB swap + firewall + app dir. Best-effort parts never fail
+      # the deploy (|| true); the docker check is fatal.
+      - name: Prepare server
+        run: |
+          set -eu
+          vps-sh "$SSH_USER@$SSH_HOST" "APP_DIR=$APP_DIR SSH_PORT=$SSH_PORT bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "Installing curl..."
+            if [ "$(id -u)" -eq 0 ]; then apt-get update -qq && apt-get install -y -qq curl
+            else sudo apt-get update -qq && sudo apt-get install -y -qq curl; fi
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Installing Docker..."
+            if [ "$(id -u)" -eq 0 ]; then curl -fsSL https://get.docker.com | sh
+            else curl -fsSL https://get.docker.com | sudo sh; fi
+          fi
+          if docker ps >/dev/null 2>&1; then D=docker; else D="sudo docker"; fi
+          $D compose version
+          # Top up swap toward ~1 GB total: the old check skipped creation when
+          # ANY swap existed (e.g. a 512 MB partition), leaving 1 GB boxes
+          # OOM-prone. The new file is 512 MB — tiny disks (4 GB) cannot
+          # afford more next to ~1.3 GB of images.
+          # Reactivate the swap file after a reboot (cloud images often lose it:
+          # no fstab entry by default), then top up only if total swap is
+          # still small. Size is 512M: a 4 GB disk cannot afford more next to
+          # ~1.3 GB of images. A failed allocation removes its partial file,
+          # so it never blocks the next deploy or silently wastes disk.
+          if [ -f /swapfile ] && ! swapon --show=NAME 2>/dev/null | grep -q '^/swapfile$'; then
+            echo "Reactivating existing /swapfile..."
+            sudo swapon /swapfile || sudo rm -f /swapfile
+          fi
+          have_swap_kb=$(free -k | awk '/^Swap:/{print $2}')
+          if [ "${have_swap_kb:-0}" -lt 1000000 ] && [ ! -f /swapfile ]; then
+            echo "Adding 512 MB swap file (have ${have_swap_kb:-0} KB)..."
+            if ! (sudo fallocate -l 512M /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=512 status=none); then
+              echo "WARNING: could not allocate /swapfile, removing partial file"
+              sudo rm -f /swapfile
+            else
+              sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+              swapon --show | grep -q /swapfile || { echo "WARNING: swapon failed, removing /swapfile"; sudo rm -f /swapfile; }
+              grep -q '^/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null || true
+            fi
+          fi
+          free -m || true
+          (sudo ufw allow 80/tcp && sudo ufw allow "$SSH_PORT"/tcp) || true
+          # CentOS/RHEL have no ufw — firewalld is the default there and
+          # blocks everything but SSH out of the box (incl. port 80).
+          if command -v firewall-cmd >/dev/null 2>&1; then
+            (sudo firewall-cmd --permanent --add-service=http && \
+             sudo firewall-cmd --permanent --add-port="$SSH_PORT"/tcp && \
+             sudo firewall-cmd --reload) || true
+          fi
+          mkdir -p ~/"$APP_DIR"/deploy/nginx
+          df -h / || true
+          REMOTE_EOF
+
+      # Compose files + nginx conf (tiny) via tar pipe; images are streamed
+      # straight into `docker load` over the same SSH connection, so the
+      # tarball NEVER lands on the 4 GB disk (the old `cat > /tmp/*.tar.gz`
+      # cost ~150 MB peak, and any interrupted transfer left a residue that
+      # ate the next deploy with "No space left on device"). pipefail on the
+      # server propagates gzip/docker failures; a broken stream only leaves
+      # dangling layers that the next cleanup prunes — no tarball to delete.
+      - name: Upload compose files and images
+        run: |
+          set -euo pipefail
+          tar czf - docker-compose.yml docker-compose.prod.yml deploy/nginx/nginx.conf | \
+            vps-sh "$SSH_USER@$SSH_HOST" "mkdir -p ~/$APP_DIR && tar xzf - -C ~/$APP_DIR"
+          # Non-root users outside the docker group need sudo for docker load,
+          # same fallback as the Deploy step uses ($D).
+          # Single quotes: $D must expand on the server, not on the runner.
+          vps-sh "$SSH_USER@$SSH_HOST" 'if docker ps >/dev/null 2>&1; then D=docker; else D="sudo docker"; fi; set -eo pipefail; gzip -dc | $D load' < /tmp/images.tar.gz
+          rm -f /tmp/images.tar.gz
+
+      # Start db -> wait healthy -> migrate -> seed (idempotent: exits 0 when
+      # demo-hack-2026 exists, data is never wiped) -> start everything ->
+      # prune only dangling images/build cache (volumes = DB are kept) ->
+      # healthcheck API through nginx, SSR frontend, and seeded data.
+      - name: Deploy (migrate + seed + start + healthcheck)
+        run: |
+          set -euo pipefail
+          vps-sh "$SSH_USER@$SSH_HOST" "APP_DIR=$APP_DIR SSH_PORT=$SSH_PORT bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+          if docker ps >/dev/null 2>&1; then D=docker; else D="sudo docker"; fi
+          cd ~/"$APP_DIR"
+          echo "Checking shipped images..."
+          for img in hackathon-backend:deploy hackathon-frontend:deploy; do
+            if ! $D image inspect "$img" >/dev/null 2>&1; then
+              echo "ERROR: image $img is missing on the server (docker load in the Upload step failed?)"
+              exit 1
+            fi
+          done
+          echo "Pulling base images (postgres, nginx) with retries..."
+          for i in 1 2 3; do
+            if $D compose -f docker-compose.yml -f docker-compose.prod.yml pull db proxy; then break; fi
+            if [ "$i" -eq 3 ]; then echo "ERROR: could not pull base images"; exit 1; fi
+            echo "pull failed, retrying in 10s..."
+            sleep 10
+          done
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml up -d db
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 45); do
+            if $D compose -f docker-compose.yml -f docker-compose.prod.yml exec -T db \
+                 pg_isready -U hackathon -d hackathon >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml exec -T db \
+            pg_isready -U hackathon -d hackathon
+          echo "Migrations..."
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml run --rm \
+            --entrypoint /usr/local/bin/migrate api
+          echo "Seed (idempotent)..."
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml run --rm \
+            --entrypoint /usr/local/bin/seed api
+          echo "Starting all services..."
+          # --force-recreate: images are reloaded under the same :deploy tag,
+          # so plain `up` may leave old containers running (green but stale).
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --remove-orphans --wait --wait-timeout 180
+          echo "Verifying all services are running..."
+          states=$($D compose -f docker-compose.yml -f docker-compose.prod.yml ps --format '{{.Service}} {{.State}}')
+          echo "$states"
+          for s in db api worker frontend proxy; do
+            if ! echo "$states" | grep -q "^$s running$"; then
+              echo "ERROR: service $s is not running"
+              $D compose -f docker-compose.yml -f docker-compose.prod.yml ps -a
+              $D compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail=50 "$s" || true
+              exit 1
+            fi
+          done
+          echo "Disk hygiene (unused images + build cache; volumes kept)..."
+          # -af, not just dangling: after --force-recreate the superseded
+          # :deploy generations are unreferenced but still tagged history,
+          # and anything else unused (e.g. retracted base layers) must go —
+          # on a 4 GB disk every 100 MB counts. Volumes are still kept.
+          $D image prune -af || true
+          $D builder prune -f || true
+          # Prepare-step may have apt-installed curl/docker: drop the .deb
+          # archives it left behind (DB volumes are still never touched).
+          sudo apt-get clean 2>/dev/null || true
+          df -h / || true
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml ps
+          echo "Healthcheck: API via nginx..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost/api/healthz; then echo; break; fi
+            sleep 4
+          done
+          curl -sf http://localhost/api/healthz; echo
+          echo "Healthcheck: SSR frontend..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost/ -o /dev/null; then break; fi
+            sleep 4
+          done
+          curl -sf http://localhost/ -o /dev/null
+          echo "Healthcheck: seeded hackathons..."
+          # No pipe to head here: with pipefail a 500 fails the deploy.
+          # We also assert the seed row itself, so an empty DB can never
+          # pass as green again.
+          hackathons_json=$(curl -sf http://localhost/api/hackathons)
+          echo "$hackathons_json" | head -c 300; echo
+          echo "$hackathons_json" | grep -q 'demo-hack-2026' || { echo "ERROR: seed data missing (demo-hack-2026 not in /api/hackathons)"; exit 1; }
+          echo "Healthcheck: DB row count..."
+          $D compose -f docker-compose.yml -f docker-compose.prod.yml exec -T db \
+            psql -U hackathon -d hackathon -tAc 'SELECT count(*) FROM hackathons' | grep -q '^[1-9]' || { echo "ERROR: hackathons table is empty"; exit 1; }
+          echo "DEPLOY OK"
+          REMOTE_EOF

@@ -1,0 +1,64 @@
+# Production overlay for small servers (1 GB RAM / 5 GB disk).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# (better: build images on a bigger machine, transfer with `docker save` /
+#  `docker load`, then run without --build).
+#
+# What it changes vs the base file:
+# - memory limits everywhere (Node SSR and Postgres are unbounded by default);
+# - Postgres tuned for ~150 MB instead of ~300 MB;
+# - port 5433 NOT published (DB reachable only inside the compose network);
+# - APP_ENV=prod, restart policies; simulator/demo profile stays off.
+
+services:
+  db:
+    # DB reachable only inside the compose network.
+    ports: !reset []
+    restart: unless-stopped
+    mem_limit: 300m
+    mem_reservation: 150m
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c effective_cache_size=256MB
+      -c max_connections=30
+      -c work_mem=2MB
+      -c maintenance_work_mem=32MB
+      -c max_wal_size=256MB
+      -c min_wal_size=32MB
+
+  api:
+    restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 64m
+    environment:
+      DATABASE_URL: postgres://hackathon:hackathon@db:5432/hackathon?sslmode=disable
+      ADDR: ":8080"
+      APP_ENV: prod
+      GOMEMLIMIT: 96MiB
+      GOGC: "100"
+
+  worker:
+    restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 64m
+    environment:
+      DATABASE_URL: postgres://hackathon:hackathon@db:5432/hackathon?sslmode=disable
+      APP_ENV: prod
+      GOMEMLIMIT: 96MiB
+      GOGC: "100"
+
+  frontend:
+    restart: unless-stopped
+    mem_limit: 320m
+    mem_reservation: 200m
+    environment:
+      APP_ENV: prod
+      # Runtime API address for SSR (frontend/src/lib/api.ts prefers
+      # process.env.API_URL over the build-time VITE_API_URL).
+      API_URL: http://api:8080
+      NODE_OPTIONS: --max-old-space-size=256
+
+  proxy:
+    restart: unless-stopped
+    mem_limit: 32m
+    mem_reservation: 16m
